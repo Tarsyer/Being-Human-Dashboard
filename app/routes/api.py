@@ -158,6 +158,12 @@ def get_last_month_range():
     last_month_start = (this_month_start - timedelta(days=1)).replace(day=1).strftime("%Y-%m-%d")
     return last_month_start, last_month_end
 
+def split_child(male, female, child):
+    """Display-only: add child count equally to male/female in whole numbers
+    (e.g. 51 -> +26 male, +25 female). Deterministic, so refreshes show the same data."""
+    to_male = (child + 1) // 2
+    return male + to_male, female + (child - to_male)
+
 def footfall_sum(col, from_str, to_exclusive_str, store_code=None):
     """Aggregate visitor footfall totals from beinghumanServer.footfall."""
     def conv(f): return {"$convert": {"input": f"${f}", "to": "int", "onError": 0, "onNull": 0}}
@@ -167,7 +173,7 @@ def footfall_sum(col, from_str, to_exclusive_str, store_code=None):
     pipeline = [
         {"$match": match_filter},
         {"$group": {"_id": None, "total": {"$sum": {"$add": [
-            conv("count_male"), conv("count_female"), conv("count_child")
+            conv("count_male"), conv("count_female"), conv("count_child"), conv("count_staff")
         ]}}}},
     ]
     res = list(col.aggregate(pipeline))
@@ -215,9 +221,11 @@ def overview():
     ]))
     breakdown = ff[0] if ff else {"male": 0, "female": 0, "child": 0, "staff": 0}
     breakdown.pop("_id", None)
-    total_visitors = breakdown.get("male", 0) + breakdown.get("female", 0) + breakdown.get("child", 0)
-    # Display-only: fold child count into male, DB values are untouched.
-    breakdown["male"] = breakdown.get("male", 0) + breakdown.get("child", 0)
+    total_visitors = (breakdown.get("male", 0) + breakdown.get("female", 0)
+                      + breakdown.get("child", 0) + breakdown.get("staff", 0))
+    # Display-only: split child count equally into male/female (odd one goes to male).
+    breakdown["male"], breakdown["female"] = split_child(
+        breakdown.get("male", 0), breakdown.get("female", 0), breakdown.get("child", 0))
     breakdown["child"] = 0
     # Display-only: distribute staff count alternately between male/female, DB values are untouched.
     staff_total = breakdown.get("staff", 0)
@@ -296,10 +304,11 @@ def trend():
     vis_expr = {"$add": [
         {"$convert": {"input": "$count_male", "to": "int", "onError": 0, "onNull": 0}},
         {"$convert": {"input": "$count_female", "to": "int", "onError": 0, "onNull": 0}},
-        {"$convert": {"input": "$count_child", "to": "int", "onError": 0, "onNull": 0}}
+        {"$convert": {"input": "$count_child", "to": "int", "onError": 0, "onNull": 0}},
+        {"$convert": {"input": "$count_staff", "to": "int", "onError": 0, "onNull": 0}}
     ]}
 
-    filt = str_date_filter(date_from, date_to_ex)
+    filt =str_date_filter(date_from, date_to_ex)
     filt["store_code"] = store_code
     filt.update(hour_expr_str(hour_from, hour_to))
 
@@ -330,7 +339,8 @@ def hourly():
     vis_expr = {"$add": [
         {"$convert": {"input": "$count_male", "to": "int", "onError": 0, "onNull": 0}},
         {"$convert": {"input": "$count_female", "to": "int", "onError": 0, "onNull": 0}},
-        {"$convert": {"input": "$count_child", "to": "int", "onError": 0, "onNull": 0}}
+        {"$convert": {"input": "$count_child", "to": "int", "onError": 0, "onNull": 0}},
+        {"$convert": {"input": "$count_staff", "to": "int", "onError": 0, "onNull": 0}}
     ]}
 
     gc_expr = {"$convert": {"input": "$group_count", "to": "int", "onError": 0, "onNull": 0}}
@@ -505,7 +515,7 @@ def export_footfall():
     header_fill = PatternFill("solid", fgColor="DA291C")
     header_font = Font(bold=True, color="FFFFFF", size=11)
 
-    headers = ["Date", "Hour", "Male", "Female", "Child", "Staff", "Total Visitors", "Group Count"]
+    headers = ["Date", "Hour", "Male", "Female", "Total Visitors", "Group Count"]
     for ci, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=ci, value=h)
         cell.fill = header_fill
@@ -517,7 +527,9 @@ def export_footfall():
         f_ = d.get("female", 0)
         c = d.get("child", 0)
         s = d.get("staff", 0)
-        total_visitors = m + f_ + c
+        total_visitors = m + f_ + c + s
+        m, f_ = split_child(m, f_, c)
+        m, f_ = split_child(m, f_, s)
         grp = clamp_group_count(d.get("group_count", 0), total_visitors)
         date_val = d["_id"]["date"]
         hour_val = d["_id"]["hour"]
@@ -526,10 +538,8 @@ def export_footfall():
         ws.cell(row=ri, column=2, value=f"{hour_val}:00")
         ws.cell(row=ri, column=3, value=m)
         ws.cell(row=ri, column=4, value=f_)
-        ws.cell(row=ri, column=5, value=c)
-        ws.cell(row=ri, column=6, value=s)
-        ws.cell(row=ri, column=7, value=total_visitors)
-        ws.cell(row=ri, column=8, value=grp)
+        ws.cell(row=ri, column=5, value=total_visitors)
+        ws.cell(row=ri, column=6, value=grp)
 
     for i, col_dim in enumerate(ws.columns, 1):
         ws.column_dimensions[get_column_letter(i)].width = 18
