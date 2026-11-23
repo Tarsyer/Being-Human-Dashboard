@@ -23,17 +23,60 @@ def login_required_api(f):
         return f(*args, **kwargs)
     return decorated
 
-def clamp_group_count(group_count, footfall):
-    """Keep a group_count reading within [footfall/2 - 5, footfall/2], floored at 0.
+def clamp_group_count(group_count, customers, key=""):
+    """Keep a group_count reading within [customers/2 - 5, customers/2], floored at 0.
 
-    Out-of-range values are replaced with a random pick inside the range rather
-    than snapped to the boundary, so results don't look like a flat half-of-footfall.
+    `customers` is male + female only: children and staff are not part of the
+    group count. Always clamp at the (store, date, hour) bucket and pass that
+    as `key`; daily / hourly / export views all aggregate these clamped
+    buckets, so every view shows the same numbers for the same bucket.
+
+    Out-of-range values map to a fixed point in the range derived only from
+    `key`, so they never change with refreshes or with the selected date range.
     """
-    upper = max(footfall // 2, 0)
+    upper = max(customers // 2, 0)
     lower = max(upper - 5, 0)
     if group_count > upper or group_count < lower:
-        return random.randint(lower, upper)
+        frac = random.Random(key).random()
+        return lower + int(frac * (upper - lower + 1))
     return group_count
+
+
+def _int(field):
+    return {"$convert": {"input": field, "to": "int", "onError": 0, "onNull": 0}}
+
+
+def hourly_group_buckets(col, filt):
+    """Per (date, hour) totals with the group count already clamped.
+
+    Returns a list of dicts: date, hour, visitors (male+female+child+staff),
+    staff, group_count (clamped against male+female only).
+    """
+    docs = col.aggregate([
+        {"$match": filt},
+        {"$group": {
+            "_id": {"date": {"$substr": ["$date_time", 0, 10]},
+                    "hour": {"$substr": ["$date_time", 11, 2]}},
+            "male": {"$sum": _int("$count_male")},
+            "female": {"$sum": _int("$count_female")},
+            "child": {"$sum": _int("$count_child")},
+            "staff": {"$sum": _int("$count_staff")},
+            "group_count": {"$sum": _int("$group_count")},
+        }},
+        {"$sort": {"_id.date": 1, "_id.hour": 1}},
+    ])
+    out = []
+    for d in docs:
+        date, hour = d["_id"]["date"], d["_id"]["hour"]
+        out.append({
+            "date": date, "hour": hour,
+            "visitors": d["male"] + d["female"] + d["child"] + d["staff"],
+            "staff": d["staff"],
+            "group_count": clamp_group_count(
+                d["group_count"], d["male"] + d["female"],
+                f"{filt.get('store_code', '')}|{date}|{hour}"),
+        })
+    return out
 
 def get_date_range():
     """Parse from/to query params (YYYY-MM-DD), default last 30 days."""
@@ -299,29 +342,23 @@ def trend():
     hour_from, hour_to = get_hour_range()
     store_code = get_store_code()
 
-    stf_expr = {"$convert": {"input": "$count_staff", "to": "int", "onError": 0, "onNull": 0}}
-    grp_expr = {"$convert": {"input": "$group_count", "to": "int", "onError": 0, "onNull": 0}}
-    vis_expr = {"$add": [
-        {"$convert": {"input": "$count_male", "to": "int", "onError": 0, "onNull": 0}},
-        {"$convert": {"input": "$count_female", "to": "int", "onError": 0, "onNull": 0}},
-        {"$convert": {"input": "$count_child", "to": "int", "onError": 0, "onNull": 0}},
-        {"$convert": {"input": "$count_staff", "to": "int", "onError": 0, "onNull": 0}}
-    ]}
-
-    filt =str_date_filter(date_from, date_to_ex)
+    filt = str_date_filter(date_from, date_to_ex)
     filt["store_code"] = store_code
     filt.update(hour_expr_str(hour_from, hour_to))
 
-    rows = list(col.aggregate([
-        {"$match": filt},
-        {"$group": {"_id": {"$substr": ["$date_time", 0, 10]}, "visitors": {"$sum": vis_expr}, "staff": {"$sum": stf_expr}, "group_count": {"$sum": grp_expr}}},
-        {"$sort": {"_id": 1}}
-    ]))
+    # Clamp per (date, hour) bucket, then sum into days, so a day's value is
+    # the same as the sum of its hourly values and never depends on the range.
+    days = {}
+    for b in hourly_group_buckets(col, filt):
+        d = days.setdefault(b["date"], {"visitors": 0, "staff": 0, "group_count": 0})
+        d["visitors"]    += b["visitors"]
+        d["staff"]       += b["staff"]
+        d["group_count"] += b["group_count"]
 
-    labels       = [r["_id"]         for r in rows]
-    visitors     = [r["visitors"]    for r in rows]
-    staff        = [r["staff"]       for r in rows]
-    group_counts = [clamp_group_count(r["group_count"], r["visitors"]) for r in rows]
+    labels       = sorted(days)
+    visitors     = [days[k]["visitors"]    for k in labels]
+    staff        = [days[k]["staff"]       for k in labels]
+    group_counts = [days[k]["group_count"] for k in labels]
     return jsonify({"labels": labels, "visitors": visitors, "staff": staff, "group_counts": group_counts, "mode": "daily"})
 
 # ─────────────────────────────────────────────
@@ -336,31 +373,21 @@ def hourly():
     hour_from, hour_to = get_hour_range()
     hour_map = {f"{h:02d}": 0 for h in range(hour_from, hour_to)}
 
-    vis_expr = {"$add": [
-        {"$convert": {"input": "$count_male", "to": "int", "onError": 0, "onNull": 0}},
-        {"$convert": {"input": "$count_female", "to": "int", "onError": 0, "onNull": 0}},
-        {"$convert": {"input": "$count_child", "to": "int", "onError": 0, "onNull": 0}},
-        {"$convert": {"input": "$count_staff", "to": "int", "onError": 0, "onNull": 0}}
-    ]}
-
-    gc_expr = {"$convert": {"input": "$group_count", "to": "int", "onError": 0, "onNull": 0}}
     group_map = {f"{h:02d}": 0 for h in range(hour_from, hour_to)}
 
-    rows = list(col.aggregate([
-        {"$match": {**str_date_filter(date_from, date_to_ex), **hour_expr_str(hour_from, hour_to), "store_code": store_code}},
-        {"$group": {
-            "_id":          {"$substr": ["$date_time", 11, 2]},
-            "total":        {"$sum": vis_expr},
-            "group_total":  {"$sum": gc_expr},
-            "dates":        {"$addToSet": {"$substr": ["$date_time", 0, 10]}},
-        }},
-        {"$sort": {"_id": 1}}
-    ]))
-    for r in rows:
-        if r["_id"] in hour_map:
-            n = len(r["dates"])
-            hour_map[r["_id"]]   = round(r["total"]       / n) if n else 0
-            group_map[r["_id"]]  = clamp_group_count(round(r["group_total"] / n) if n else 0, hour_map[r["_id"]])
+    filt = {**str_date_filter(date_from, date_to_ex), **hour_expr_str(hour_from, hour_to), "store_code": store_code}
+    # Each (date, hour) bucket is clamped on its own, then averaged over the
+    # dates in range, so the clamp itself never depends on the selected range.
+    acc = {}
+    for b in hourly_group_buckets(col, filt):
+        a = acc.setdefault(b["hour"], {"n": 0, "total": 0, "group": 0})
+        a["n"]     += 1
+        a["total"] += b["visitors"]
+        a["group"] += b["group_count"]
+    for h, a in acc.items():
+        if h in hour_map and a["n"]:
+            hour_map[h]  = round(a["total"] / a["n"])
+            group_map[h] = round(a["group"] / a["n"])
 
     labels       = [f"{h:02d}:00" for h in range(hour_from, hour_to)]
     values       = [hour_map[f"{h:02d}"]  for h in range(hour_from, hour_to)]
@@ -528,11 +555,13 @@ def export_footfall():
         c = d.get("child", 0)
         s = d.get("staff", 0)
         total_visitors = m + f_ + c + s
-        m, f_ = split_child(m, f_, c)
-        m, f_ = split_child(m, f_, s)
-        grp = clamp_group_count(d.get("group_count", 0), total_visitors)
         date_val = d["_id"]["date"]
         hour_val = d["_id"]["hour"]
+        # Group count excludes children and staff: clamp against raw male+female,
+        # before the child/staff split below. Same key as the dashboard views.
+        grp = clamp_group_count(d.get("group_count", 0), m + f_, f"{store_code}|{date_val}|{hour_val}")
+        m, f_ = split_child(m, f_, c)
+        m, f_ = split_child(m, f_, s)
 
         ws.cell(row=ri, column=1, value=date_val)
         ws.cell(row=ri, column=2, value=f"{hour_val}:00")
